@@ -1,0 +1,443 @@
+import pandas as pd
+import sys
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import coordinate_from_string, column_index_from_string
+from datetime import datetime
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURATION  — only edit this section, then run
+# ══════════════════════════════════════════════════════════════════════════════
+
+CSV_PATH    = "Q1'26_Channel_nps_view_data.csv"
+OUTPUT_PATH = r"CNI_Desjardins_Output - Q1'26.xlsx"   # ← PASTE YOUR FULL PATH HERE
+
+# ── Rolling window ─────────────────────────────────────────────────────────────
+ROLLING = 4   # ← change to 1 / 2 / 3 / 4 / 5
+
+# ── Target cell map ────────────────────────────────────────────────────────────
+CELL_MAP = {
+    # ── Digital ───────────────────────────────────────────────────────────────
+    ("Digital",      1, "YoY"): "B238",
+    ("Digital",      2, "YoY"): "B247",
+    ("Digital",      3, "YoY"): "B256",
+    ("Digital",      1, "QoQ"): "B265",
+    ("Digital",      2, "QoQ"): "B274",
+    ("Digital",      3, "QoQ"): "B284",
+    # ── Call Center ───────────────────────────────────────────────────────────
+    ("Call Center",  1, "YoY"): "O238",
+    ("Call Center",  2, "YoY"): "O247",
+    ("Call Center",  3, "YoY"): "O256",
+    ("Call Center",  1, "QoQ"): "O265",
+    ("Call Center",  2, "QoQ"): "O274",
+    ("Call Center",  3, "QoQ"): "O284",
+    # ── Broker/Agent ──────────────────────────────────────────────────────────
+    ("Broker/Agent", 1, "YoY"): "AB238",
+    ("Broker/Agent", 2, "YoY"): "AB247",
+    ("Broker/Agent", 3, "YoY"): "AB256",
+    ("Broker/Agent", 1, "QoQ"): "AB265",
+    ("Broker/Agent", 2, "QoQ"): "AB274",
+    ("Broker/Agent", 3, "QoQ"): "AB284",
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+COLS = [
+    "provider_name", "nps_period", "nps_nps_category_value",
+    "nps_nps_weight", "nps_region", "nps_initial_channel_group"
+]
+
+ALL_REGIONS = [
+    "Alberta", "British Columbia", "Manitoba", "New Brunswick",
+    "Newfoundland and Labrador", "Nova Scotia",
+    "Nunavut / Northwest Territories", "Ontario",
+    "Prince Edward Island", "Quebec", "Saskatchewan", "Yukon"
+]
+
+REGION_OPTIONS = {
+    1: ("All Regions Canada", ALL_REGIONS),
+    2: ("Quebec",             ["Quebec"]),
+    3: ("Rest of Canada",     [r for r in ALL_REGIONS if r != "Quebec"]),
+}
+
+CHANNEL_GROUPS = {
+    "Digital":      ["(Digital) Mobile app", "(Digital) Online"],
+    "Call Center":  ["(Human) Call center IVR", "(Human) Call center rep"],
+    "Broker/Agent": ["(Human) Insurer/ Agent branch", "(Human) Broker"],
+}
+
+CHANNEL_DISPLAY = {
+    "Digital":      "Digital (online + mobile)",
+    "Call Center":  "Call Center (IVR + reps)",
+    "Broker/Agent": "Broker/Agent",
+}
+
+PROVIDER_DISPLAY_NAMES = {
+    "CAA Insurance Company":          "CAA",
+    "The Personal":                   "Personal",
+    "Desjardins Agent Network":       "DAN",
+    "Co-operators":                   "Co-operators",
+    "Economical":                     "Economical",
+    "Allstate":                       "Allstate",
+    "DI Direct":                      "DI Direct",
+    "RBC Insurance":                  "RBC",
+    "Intact Insurance":               "Intact",
+    "BelairDirect":                   "BelairDirect",
+    "Aviva":                          "Aviva",
+    "TD Insurance":                   "TD Insurance",
+    "Wawanesa Insurance":             "Wawanesa",
+    "Promutuel Assurance":            "Promutuel",
+    "Beneva":                         "Beneva",
+    "Industrial Alliance (iA)":       "iA",
+    "Definity":                       "Definity",
+    "Economical (becoming Definity)": "Economical (becoming Definity)",
+}
+
+# ── Provider column order per channel × region ─────────────────────────────────
+PROVIDER_ORDER = {
+    # ── All Regions Canada ─────────────────────────────────────────────────────
+    (1, "Digital"): [
+        "Allstate", "Aviva", "Beneva", "Desjardins Agent Network",
+        "DI Direct", "Intact Insurance", "The Personal",
+        "CAA Insurance Company", "Promutuel Assurance",
+        "Definity", "Economical (becoming Definity)",
+    ],
+    (1, "Call Center"): [
+        "Allstate", "Aviva", "Beneva", "Desjardins Agent Network",
+        "DI Direct", "Intact Insurance", "The Personal",
+        "CAA Insurance Company", "Promutuel Assurance",
+        "Definity", "Economical (becoming Definity)",
+    ],
+    (1, "Broker/Agent"): [
+        "Allstate", "Aviva", "Beneva",
+        "CAA Insurance Company", "Desjardins Agent Network",
+        "Intact Insurance", "Promutuel Assurance",
+        "Definity", "Economical (becoming Definity)",
+    ],
+    # ── Quebec ────────────────────────────────────────────────────────────────
+    (2, "Digital"): [
+        "Allstate", "Aviva", "Beneva", "DI Direct",
+        "Intact Insurance", "The Personal",
+        "CAA Insurance Company", "Promutuel Assurance",
+        "Definity", "Economical (becoming Definity)",
+    ],
+    (2, "Call Center"): [
+        "Allstate", "Aviva", "Beneva", "DI Direct",
+        "Intact Insurance", "The Personal",
+        "CAA Insurance Company", "Promutuel Assurance",
+        "Definity", "Economical (becoming Definity)",
+    ],
+    (2, "Broker/Agent"): [
+        "Allstate", "Aviva", "Beneva",
+        "CAA Insurance Company",
+        "Intact Insurance", "Promutuel Assurance",
+        "Definity", "Economical (becoming Definity)",
+    ],
+    # ── Rest of Canada ────────────────────────────────────────────────────────
+    (3, "Digital"): [
+        "Allstate", "Aviva", "Desjardins Agent Network",
+        "DI Direct", "Intact Insurance", "The Personal",
+        "CAA Insurance Company",
+        "Definity", "Economical (becoming Definity)",
+    ],
+    (3, "Call Center"): [
+        "Allstate", "Aviva", "Desjardins Agent Network",
+        "DI Direct", "Intact Insurance", "The Personal",
+        "CAA Insurance Company",
+        "Definity", "Economical (becoming Definity)",
+    ],
+    (3, "Broker/Agent"): [
+        "Allstate", "Aviva",
+        "CAA Insurance Company", "Desjardins Agent Network",
+        "Intact Insurance",
+        "Definity", "Economical (becoming Definity)",
+    ],
+}
+
+PERIOD_ORDER = [
+    "2020", "Q2 2021", "Q3+Q4 2021",
+    "Q1 2022", "Q2 2022", "Q3 2022", "Q4 2022",
+    "Q1 2023", "Q2 2023", "Q3 2023", "Q4 2023",
+    "Q1 2024", "Q2 2024", "Q3 2024", "Q4 2024",
+    "Q1 2025", "Q2 2025", "Q3 2025", "Q4 2025","Q1 2026"
+]
+
+DATA_SHEET    = "Data"
+SUMMARY_SHEET = "Summary"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PERIOD HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_rolling_periods(anchor, n_quarters, avail_periods):
+    ordered = [p for p in PERIOD_ORDER if p in avail_periods]
+    if anchor not in ordered:
+        return [anchor]
+    idx   = ordered.index(anchor)
+    start = max(0, idx - n_quarters + 1)
+    return ordered[start: idx + 1]
+
+
+def derive_anchors(avail_periods):
+    cur = avail_periods[-1]
+    idx = avail_periods.index(cur)
+    yoy = avail_periods[idx - 4] if idx >= 4 else None
+    qoq = avail_periods[idx - 1] if idx >= 1 else None
+    return cur, yoy, qoq
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  cNPS FORMULA
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_cnps(data, channel_filter):
+    if channel_filter:
+        data = data[data["nps_initial_channel_group"].isin(channel_filter)]
+    out = {}
+    for provider, grp in data.groupby("provider_name"):
+        den = grp["nps_nps_weight"].sum()
+        if den == 0:
+            continue
+        out[provider] = round(
+            (grp["nps_nps_weight"] * grp["nps_nps_category_value"]).sum() / den * 100, 4
+        )
+    return out
+
+
+def compute_rolling_cnps(df_region, anchor, n_quarters, avail_periods, channel_filter):
+    periods = get_rolling_periods(anchor, n_quarters, avail_periods)
+    return compute_cnps(
+        df_region[df_region["nps_period"].isin(periods)].copy(),
+        channel_filter
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TERMINAL PRINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def sep(char="─", w=100): print(char * w)
+def sep2(w=100):           print("═" * w)
+
+
+def print_block(cur_result, prev_result, providers,
+                channel, region_label, comp_type, cur_anchor, prev_anchor):
+    ch_disp  = CHANNEL_DISPLAY.get(channel, channel)
+    summary  = (f"R{ROLLING} | {region_label} | {ch_disp} | "
+                f"Cur: {cur_anchor} | Prev ({comp_type}): {prev_anchor}")
+    sep2()
+    print(f"  {summary}")
+    sep2()
+
+    def dn(p): return PROVIDER_DISPLAY_NAMES.get(p, p)
+
+    LABEL_W = 10
+    COL_W   = 12
+
+    hdr = f"  {'Series':<{LABEL_W}}"
+    for p in providers:
+        hdr += f"{dn(p):>{COL_W}}"
+    sep()
+    print(hdr)
+    sep()
+
+    row_cur = f"  {cur_anchor:<{LABEL_W}}"
+    for p in providers:
+        v = cur_result.get(p)
+        row_cur += f"{(f'{v:.4f}' if v is not None else '—'):>{COL_W}}"
+    print(row_cur)
+
+    row_prev = f"  {prev_anchor:<{LABEL_W}}"
+    for p in providers:
+        v = prev_result.get(p)
+        row_prev += f"{(f'{v:.4f}' if v is not None else '—'):>{COL_W}}"
+    print(row_prev)
+
+    sep()
+    print()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  EXCEL WRITER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def write_block(wd, ws_sum, cell_ref,
+                cur_result, prev_result, providers,
+                channel, region_key, region_label, comp_type,
+                cur_anchor, prev_anchor):
+    ch_disp = CHANNEL_DISPLAY.get(channel, channel)
+
+    col_letter, row_num = coordinate_from_string(cell_ref)
+    c = column_index_from_string(col_letter)
+    r = int(row_num)
+
+    def dn(p): return PROVIDER_DISPLAY_NAMES.get(p, p)
+
+    ORANGE_HDR = PatternFill("solid", start_color="FCE4D6", end_color="FCE4D6")
+    ORANGE_LBL = PatternFill("solid", start_color="FCE4D6", end_color="FCE4D6")
+    WHITE      = PatternFill("solid", start_color="FFFFFF", end_color="FFFFFF")
+    F_HDR      = Font(name="Calibri", bold=False, size=11)
+    F_DATA     = Font(name="Calibri", size=11)
+    F_SUMMARY  = Font(name="Calibri", bold=True, size=10)
+    CNTR       = Alignment(horizontal="center", vertical="center")
+    LEFT       = Alignment(horizontal="left",   vertical="center")
+    thin       = Side(style="thin", color="D9D9D9")
+    BDR        = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def sty(cell, font=None, fill=None, align=None, num_fmt=None):
+        if font:    cell.font          = font
+        if fill:    cell.fill          = fill
+        if align:   cell.alignment     = align
+        if num_fmt: cell.number_format = num_fmt
+        cell.border = BDR
+
+    # Summary one row above
+    summary = (f"R{ROLLING} | {region_label} | {ch_disp} | "
+               f"Cur: {cur_anchor} | Prev ({comp_type}): {prev_anchor}")
+    sc = wd.cell(row=r - 1, column=c, value=summary)
+    sc.font      = F_SUMMARY
+    sc.alignment = LEFT
+
+    # Header row
+    hdr_cell = wd.cell(row=r, column=c, value="Series")
+    sty(hdr_cell, font=F_HDR, fill=ORANGE_HDR, align=LEFT)
+    hdr_cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+    for i, p in enumerate(providers):
+        ci   = c + 1 + i
+        cell = wd.cell(row=r, column=ci, value=dn(p))
+        sty(cell, font=F_HDR, fill=ORANGE_HDR, align=CNTR)
+        wd.column_dimensions[get_column_letter(ci)].width = 12
+    wd.column_dimensions[get_column_letter(c)].width = 12
+    wd.row_dimensions[r].height = 16
+
+    # Data rows
+    for row_i, (anchor, result) in enumerate([(cur_anchor, cur_result),
+                                               (prev_anchor, prev_result)]):
+        r2  = r + 1 + row_i
+        lbl = wd.cell(row=r2, column=c, value=anchor)
+        sty(lbl, font=F_HDR, fill=ORANGE_LBL, align=LEFT)
+
+        for i, p in enumerate(providers):
+            ci  = c + 1 + i
+            val = result.get(p)
+            cell = wd.cell(row=r2, column=ci,
+                           value=round(val, 4) if val is not None else "—")
+            sty(cell, font=F_DATA, fill=WHITE, align=CNTR,
+                num_fmt="0.0000" if val is not None else None)
+        wd.row_dimensions[r2].height = 16
+
+    # Run log
+    next_row = ws_sum.max_row + 1
+    log_vals = [
+        datetime.now().strftime("%Y-%m-%d %H:%M"),
+        ch_disp, f"R{ROLLING}", region_label,
+        cur_anchor, prev_anchor, comp_type, cell_ref,
+        ", ".join(dn(p) for p in providers),
+    ]
+    log_widths = [18, 28, 6, 18, 10, 10, 6, 8, 80]
+    for ci2, (val, w) in enumerate(zip(log_vals, log_widths), start=1):
+        sc2 = ws_sum.cell(row=next_row, column=ci2, value=val)
+        sc2.font      = Font(name="Calibri", size=10)
+        sc2.alignment = LEFT
+        ws_sum.column_dimensions[get_column_letter(ci2)].width = w
+    ws_sum.row_dimensions[next_row].height = 15
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    sep2()
+    print("  cNPS CALCULATOR  —  Canada P&C Insurance  |  Channel NPS")
+    sep2()
+    print("\n📂  Loading data...")
+
+    df = pd.read_csv(CSV_PATH, usecols=COLS, low_memory=False)
+    df["nps_nps_category_value"] = pd.to_numeric(df["nps_nps_category_value"], errors="coerce")
+    df["nps_nps_weight"]         = pd.to_numeric(df["nps_nps_weight"],         errors="coerce")
+    df = df.dropna(subset=["nps_nps_category_value", "nps_nps_weight"])
+
+    avail_periods = [p for p in PERIOD_ORDER if p in df["nps_period"].unique()]
+    cur, yoy, qoq = derive_anchors(avail_periods)
+
+    print(f"✅  Ready.")
+    print(f"    Rolling        : R{ROLLING}")
+    print(f"    Current        : {cur}  →  rolling periods: {get_rolling_periods(cur, ROLLING, avail_periods)}")
+    print(f"    YoY (4Q back)  : {yoy or '(not available)'}  →  rolling periods: "
+          f"{get_rolling_periods(yoy, ROLLING, avail_periods) if yoy else 'n/a'}")
+    print(f"    QoQ (1Q back)  : {qoq or '(not available)'}  →  rolling periods: "
+          f"{get_rolling_periods(qoq, ROLLING, avail_periods) if qoq else 'n/a'}")
+    print()
+
+    try:
+        wb = load_workbook(OUTPUT_PATH)
+    except FileNotFoundError:
+        wb = Workbook()
+        if "Sheet" in wb.sheetnames:
+            del wb["Sheet"]
+
+    if DATA_SHEET not in wb.sheetnames:
+        wb.create_sheet(DATA_SHEET)
+    wd = wb[DATA_SHEET]
+
+    if SUMMARY_SHEET not in wb.sheetnames:
+        ws_sum = wb.create_sheet(SUMMARY_SHEET)
+        hdr_row = ["Timestamp", "Channel", "Rolling", "Region",
+                   "Current", "Previous", "Type", "Cell", "Providers"]
+        for ci, h in enumerate(hdr_row, start=1):
+            c = ws_sum.cell(row=1, column=ci, value=h)
+            c.font      = Font(name="Calibri", bold=True, size=10, color="FFFFFF")
+            c.fill      = PatternFill("solid", start_color="C00000", end_color="C00000")
+            c.alignment = Alignment(horizontal="center", vertical="center")
+    else:
+        ws_sum = wb[SUMMARY_SHEET]
+
+    comp_map = [("YoY", yoy), ("QoQ", qoq)]
+    total    = 0
+
+    for channel in ["Digital", "Call Center", "Broker/Agent"]:
+        ch_filter = CHANNEL_GROUPS[channel]
+
+        for region_key in [1, 2, 3]:
+            region_label, regions = REGION_OPTIONS[region_key]
+            df_region = df[df["nps_region"].isin(regions)].copy()
+            providers = PROVIDER_ORDER[(region_key, channel)]
+
+            cur_result = compute_rolling_cnps(df_region, cur, ROLLING, avail_periods, ch_filter)
+
+            for comp_type, prev_anchor in comp_map:
+                cell_ref = CELL_MAP.get((channel, region_key, comp_type))
+
+                if cell_ref is None:
+                    print(f"  ⚠️  No cell defined: {channel} | {region_label} | {comp_type} — skipped")
+                    continue
+                if prev_anchor is None:
+                    print(f"  ⚠️  {comp_type} anchor not available — skipped")
+                    continue
+
+                prev_result = compute_rolling_cnps(df_region, prev_anchor, ROLLING,
+                                                   avail_periods, ch_filter)
+
+                print_block(cur_result, prev_result, providers,
+                            channel, region_label, comp_type, cur, prev_anchor)
+
+                write_block(wd, ws_sum, cell_ref,
+                            cur_result, prev_result, providers,
+                            channel, region_key, region_label, comp_type,
+                            cur, prev_anchor)
+                total += 1
+
+    wb.save(OUTPUT_PATH)
+    print(f"\n✅  {total} blocks written → {OUTPUT_PATH}")
+    print(f"     Sheet '{DATA_SHEET}'    — see CELL_MAP for locations")
+    print(f"     Sheet '{SUMMARY_SHEET}' — {total} rows logged\n")
+
+
+if __name__ == "__main__":
+    main()

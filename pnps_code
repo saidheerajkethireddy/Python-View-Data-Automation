@@ -1,0 +1,380 @@
+import pandas as pd
+import sys
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter, column_index_from_string
+from datetime import datetime
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURATION  — only edit this section, then run
+# ══════════════════════════════════════════════════════════════════════════════
+
+CSV_PATH    = r"q1'26_pnps_data.csv"
+OUTPUT_PATH = r"CNI_Desjardins_Output - Q1'26.xlsx"
+
+COLS = [
+    "provider_name", "nps_period", "nps_nps_category_value",
+    "nps_nps_weight", "nps_region", "nps_product"
+]
+
+# ── Cell map: (rolling, product_csv, region_key) -> start cell ─────────────────
+CELL_MAP = {
+    # Rolling 1
+    (1, "Car",  1): "B148",
+    (1, "Car",  2): "B164",
+    (1, "Car",  3): "B178",
+    (1, "Home", 1): "N148",
+    (1, "Home", 2): "N164",
+    (1, "Home", 3): "N178",
+    # Rolling 4
+    (4, "Car",  1): "B192",
+    (4, "Car",  2): "B208",
+    (4, "Car",  3): "B223",
+    (4, "Home", 1): "N192",
+    (4, "Home", 2): "N208",
+    (4, "Home", 3): "N223",
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+ALL_REGIONS = [
+    "Alberta", "British Columbia", "Manitoba", "New Brunswick",
+    "Newfoundland and Labrador", "Nova Scotia",
+    "Nunavut / Northwest Territories", "Ontario",
+    "Prince Edward Island", "Quebec", "Saskatchewan", "Yukon"
+]
+
+REGION_OPTIONS = {
+    1: ("All Regions Canada", ALL_REGIONS),
+    2: ("Quebec",             ["Quebec"]),
+    3: ("Rest of Canada",     [r for r in ALL_REGIONS if r != "Quebec"]),
+}
+
+PRODUCT_OPTIONS = {
+    "Car":  "Auto",
+    "Home": "Home",
+}
+
+PROVIDER_DISPLAY_NAMES = {
+    "The Personal":                   "The Personal",
+    "Intact Insurance":               "Intact",
+    "DI Direct":                      "DI Direct",
+    "Desjardins Agent Network":       "DAN",
+    "Beneva":                         "Beneva",
+    "Aviva":                          "Aviva",
+    "Allstate":                       "Allstate",
+    "CAA Insurance Company":          "CAA",
+    "Promutuel Assurance":            "Promutuel",
+    "Definity":                       "Definity",
+    "Economical (becoming Definity)": "Economical (becoming Definity)",
+}
+
+# Provider order per (product_csv, region_key)
+PROVIDER_ORDER = {
+    ("Car",  1): [
+        "The Personal", "Intact Insurance", "DI Direct",
+        "Desjardins Agent Network", "Beneva", "Aviva",
+        "Allstate", "CAA Insurance Company", "Promutuel Assurance",
+        "Definity", "Economical (becoming Definity)",
+    ],
+    ("Car",  2): [
+        "The Personal", "Intact Insurance", "DI Direct",
+        "Beneva", "Aviva", "Allstate",
+        "CAA Insurance Company", "Promutuel Assurance",
+        "Definity", "Economical (becoming Definity)",
+    ],
+    ("Car",  3): [
+        "The Personal", "Intact Insurance", "DI Direct",
+        "Desjardins Agent Network", "Aviva",
+        "Allstate", "CAA Insurance Company",
+        "Definity", "Economical (becoming Definity)",
+    ],
+    ("Home", 1): [
+        "The Personal", "Intact Insurance", "DI Direct",
+        "Desjardins Agent Network",                      # ← FIXED: DAN added after DI Direct
+        "Aviva", "Allstate", "Beneva",
+        "CAA Insurance Company", "Promutuel Assurance",
+        "Definity", "Economical (becoming Definity)",
+    ],
+    ("Home", 2): [
+        "The Personal", "Intact Insurance", "DI Direct",
+        "Aviva", "Allstate", "Beneva",
+        "CAA Insurance Company", "Promutuel Assurance",
+        "Definity", "Economical (becoming Definity)",
+    ],
+    ("Home", 3): [
+        "The Personal", "Intact Insurance", "DI Direct",
+        "Desjardins Agent Network", "Aviva",
+        "Allstate", "CAA Insurance Company",
+        "Definity", "Economical (becoming Definity)",
+    ],
+}
+
+PERIOD_ORDER = [
+    "2020", "Q2 2021", "Q3+Q4 2021",
+    "Q1 2022", "Q2 2022", "Q3 2022", "Q4 2022",
+    "Q1 2023", "Q2 2023", "Q3 2023", "Q4 2023",
+    "Q1 2024", "Q2 2024", "Q3 2024", "Q4 2024",
+    "Q1 2025", "Q2 2025", "Q3 2025", "Q4 2025",
+    "Q1 2026",
+]
+
+DATA_SHEET    = "Data"
+SUMMARY_SHEET = "Summary"
+
+# Number of historical quarters to show (excluding current)
+HISTORY_QTRS = 7   # shows 7 columns total: 6 history + current
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def sep(char="─", w=80): print(char * w)
+def sep2(w=80):          print("═" * w)
+
+def get_rolling_periods(anchor, n_quarters, avail_periods):
+    ordered = [p for p in PERIOD_ORDER if p in avail_periods]
+    if anchor not in ordered:
+        return [anchor]
+    idx   = ordered.index(anchor)
+    start = max(0, idx - n_quarters + 1)
+    return ordered[start: idx + 1]
+
+def derive_anchors(avail_periods):
+    """Auto-detect: current=latest, history=last HISTORY_QTRS quarters before current."""
+    cur    = avail_periods[-1]
+    idx    = avail_periods.index(cur)
+    start  = max(0, idx - HISTORY_QTRS)
+    anchors = avail_periods[start: idx + 1]   # history + current
+    return anchors
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  pNPS FORMULA
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_pnps(data):
+    out = {}
+    for provider, grp in data.groupby("provider_name"):
+        den = grp["nps_nps_weight"].sum()
+        if den == 0:
+            continue
+        out[provider] = round(
+            (grp["nps_nps_weight"] * grp["nps_nps_category_value"]).sum() / den * 100, 4
+        )
+    return out
+
+def compute_rolling_pnps(df2, anchor, r_size, avail_periods):
+    periods = get_rolling_periods(anchor, r_size, avail_periods)
+    return compute_pnps(df2[df2["nps_period"].isin(periods)].copy())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  EXCEL WRITER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def write_block(wd, ws_sum, cell_ref, period_results, anchors,
+                providers, product_label, region_label, r_size):
+
+    col_letter = ""
+    row_num    = 0
+    i = 0
+    while i < len(cell_ref) and cell_ref[i].isalpha():
+        col_letter += cell_ref[i]; i += 1
+    row_num = int(cell_ref[i:])
+
+    c = column_index_from_string(col_letter)
+    r = row_num
+
+    def dn(p): return PROVIDER_DISPLAY_NAMES.get(p, p)
+
+    # Styles
+    NAVY_FILL = PatternFill("solid", start_color="1F3864", end_color="1F3864")
+    LTBLUE    = PatternFill("solid", start_color="DCE6F1", end_color="DCE6F1")
+    WHITE     = PatternFill("solid", start_color="FFFFFF", end_color="FFFFFF")
+    HDR_FONT  = Font(name="Arial", bold=True, size=10, color="FFFFFF")
+    DATA_FONT = Font(name="Arial", size=10)
+    BOLD_FONT = Font(name="Arial", bold=True, size=10)
+    CENTER    = Alignment(horizontal="center", vertical="center")
+    LEFT      = Alignment(horizontal="left",   vertical="center")
+    thin      = Side(style="thin", color="AAAAAA")
+    BORDER    = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def style(cell, font=None, fill=None, align=None, num_fmt=None):
+        if font:    cell.font          = font
+        if fill:    cell.fill          = fill
+        if align:   cell.alignment     = align
+        if num_fmt: cell.number_format = num_fmt
+        cell.border = BORDER
+
+    latest = anchors[-1]
+
+    # Summary one row above
+    summary = f"R{r_size} | {product_label} | {region_label}"
+    sc = wd.cell(row=r - 1, column=c, value=summary)
+    sc.font = BOLD_FONT; sc.alignment = LEFT
+
+    # Header row: "Series" | period anchors
+    style(wd.cell(row=r, column=c, value="Series"),
+          font=HDR_FONT, fill=NAVY_FILL, align=LEFT)
+    wd.column_dimensions[get_column_letter(c)].width = 20
+    for i2, anchor in enumerate(anchors):
+        cell = wd.cell(row=r, column=c + 1 + i2, value=anchor)
+        style(cell, font=HDR_FONT, fill=NAVY_FILL, align=CENTER)
+        wd.column_dimensions[get_column_letter(c + 1 + i2)].width = 12
+    wd.row_dimensions[r].height = 18
+
+    # Data rows: one per provider
+    for row_i, p in enumerate(providers):
+        r2         = r + 1 + row_i
+        fill       = LTBLUE if row_i % 2 == 0 else WHITE
+        val_latest = period_results[latest].get(p)
+        suffix     = f"({round(val_latest)})" if val_latest is not None else ""
+        series_lbl = f"{dn(p)}{suffix}"
+
+        style(wd.cell(row=r2, column=c, value=series_lbl),
+              font=HDR_FONT, fill=NAVY_FILL, align=LEFT)
+
+        for i2, anchor in enumerate(anchors):
+            val = period_results[anchor].get(p)
+            cell = wd.cell(row=r2, column=c + 1 + i2,
+                           value=round(val, 4) if val is not None else "—")
+            style(cell, font=DATA_FONT, fill=fill, align=CENTER,
+                  num_fmt="0.0000" if val is not None else None)
+        wd.row_dimensions[r2].height = 18
+
+    # Summary log
+    next_row = ws_sum.max_row + 1
+    log_vals = [
+        datetime.now().strftime("%Y-%m-%d %H:%M"),
+        product_label, f"R{r_size}", region_label,
+        latest, ", ".join(anchors), cell_ref,
+        ", ".join(dn(p) for p in providers),
+    ]
+    log_widths = [18, 8, 6, 18, 12, 80, 10, 80]
+    for ci2, (val, w) in enumerate(zip(log_vals, log_widths), start=1):
+        sc2 = ws_sum.cell(row=next_row, column=ci2, value=val)
+        sc2.font = Font(name="Arial", size=10)
+        sc2.alignment = LEFT
+        ws_sum.column_dimensions[get_column_letter(ci2)].width = w
+    ws_sum.row_dimensions[next_row].height = 16
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TERMINAL PRINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def print_block(period_results, anchors, providers,
+                product_label, region_label, r_size, cell_ref):
+    def dn(p): return PROVIDER_DISPLAY_NAMES.get(p, p)
+    latest = anchors[-1]
+
+    sep2()
+    print(f"  pNPS | R{r_size} | {product_label} | {region_label} | Current: {latest} → {cell_ref}")
+    sep2()
+
+    SERIES_W = 22
+    COL_W    = 12
+    print(f"  {'Series':<{SERIES_W}}", end="")
+    for anchor in anchors:
+        print(f"{anchor:>{COL_W}}", end="")
+    print()
+    sep(w=SERIES_W + 2 + COL_W * len(anchors))
+
+    for p in providers:
+        val_latest = period_results[latest].get(p)
+        suffix     = f"({round(val_latest)})" if val_latest is not None else ""
+        lbl        = f"{dn(p)}{suffix}"
+        print(f"  {lbl:<{SERIES_W}}", end="")
+        for anchor in anchors:
+            v = period_results[anchor].get(p)
+            print(f"{f'{v:.4f}' if v is not None else '—':>{COL_W}}", end="")
+        print()
+    print()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    sep2()
+    print("  pNPS CALCULATOR  —  Canada P&C Insurance")
+    sep2()
+    print("\n📂  Loading data...")
+
+    df = pd.read_csv(CSV_PATH, usecols=COLS, low_memory=False)
+    df["nps_nps_category_value"] = pd.to_numeric(df["nps_nps_category_value"], errors="coerce")
+    df["nps_nps_weight"]         = pd.to_numeric(df["nps_nps_weight"],         errors="coerce")
+    df = df.dropna(subset=["nps_nps_category_value", "nps_nps_weight"])
+
+    avail_periods = [p for p in PERIOD_ORDER if p in df["nps_period"].unique()]
+    anchors       = derive_anchors(avail_periods)
+
+    print(f"✅  Ready.")
+    print(f"    Periods  : {anchors[0]} → {anchors[-1]}  ({len(anchors)} quarters)")
+    print(f"    Blocks   : 12  (R1 + R4 × Auto + Home × 3 regions)\n")
+
+    # Open / create workbook
+    try:
+        wb = load_workbook(OUTPUT_PATH)
+    except FileNotFoundError:
+        wb = Workbook()
+        if "Sheet" in wb.sheetnames:
+            del wb["Sheet"]
+
+    if DATA_SHEET not in wb.sheetnames:
+        wb.create_sheet(DATA_SHEET)
+    wd = wb[DATA_SHEET]
+
+    if SUMMARY_SHEET not in wb.sheetnames:
+        ws_sum = wb.create_sheet(SUMMARY_SHEET)
+        hdr_row = ["Timestamp", "Product", "Rolling", "Region",
+                   "Latest", "All Anchors", "Cell", "Providers"]
+        for ci, h in enumerate(hdr_row, start=1):
+            hc = ws_sum.cell(row=1, column=ci, value=h)
+            hc.font      = Font(name="Arial", bold=True, size=10)
+            hc.fill      = PatternFill("solid", start_color="D9D9D9", end_color="D9D9D9")
+            hc.alignment = Alignment(horizontal="center", vertical="center")
+    else:
+        ws_sum = wb[SUMMARY_SHEET]
+
+    total = 0
+    for r_size in [1, 4]:
+        for prod_csv, prod_label in [("Car", "Auto"), ("Home", "Home")]:
+            for region_key in [1, 2, 3]:
+                region_label, regions = REGION_OPTIONS[region_key]
+                providers = PROVIDER_ORDER[(prod_csv, region_key)]
+                cell_ref  = CELL_MAP[(r_size, prod_csv, region_key)]
+
+                df2 = df[
+                    (df["nps_product"] == prod_csv) &
+                    (df["nps_region"].isin(regions))
+                ].copy()
+
+                avail = [p for p in PERIOD_ORDER if p in df2["nps_period"].unique()]
+                block_anchors = derive_anchors(avail)
+
+                # Compute pNPS for each anchor with rolling window
+                period_results = {}
+                for anchor in block_anchors:
+                    period_results[anchor] = compute_rolling_pnps(df2, anchor, r_size, avail)
+
+                print_block(period_results, block_anchors, providers,
+                            prod_label, region_label, r_size, cell_ref)
+
+                write_block(wd, ws_sum, cell_ref, period_results, block_anchors,
+                            providers, prod_label, region_label, r_size)
+                total += 1
+
+    wb.save(OUTPUT_PATH)
+    print(f"\n✅  {total} blocks written → {OUTPUT_PATH}")
+    print(f"     Sheet '{DATA_SHEET}'    — see CELL_MAP for locations")
+    print(f"     Sheet '{SUMMARY_SHEET}' — {total} rows logged\n")
+
+
+if __name__ == "__main__":
+    main()
